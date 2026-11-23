@@ -1,0 +1,175 @@
+---
+title: "Correctness and efficiency compared with survival::coxph"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Correctness and efficiency compared with survival::coxph}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", fig.width = 6,
+                      fig.height = 4)
+has_bench <- requireNamespace("bench", quietly = TRUE)
+```
+
+```{r setup}
+library(coxlite)
+library(survival)
+```
+
+This checks that **coxlite** gets the same answers as `survival::coxph()`
+and compares the speed of:
+
+* `coxlite` with the C++ engine (`engine = "cpp"`, the default)
+* `coxlite` with the pure-R engine (`engine = "R"`)
+* `survival::coxph()`, whose core is written in C
+
+## Correctness
+
+### One model in detail
+
+```{r}
+f <- Surv(time, status) ~ trt + age + biomarker + sex
+fit <- cox_ph(f, data = sim_trial)
+ref <- coxph(f, data = sim_trial)
+
+all.equal(coef(fit), coef(ref))
+all.equal(vcov(fit), vcov(ref), check.attributes = FALSE)
+all.equal(fit$loglik, ref$loglik)
+all.equal(fit$score, ref$score)                   # score (log-rank) test
+all.equal(fit$wald.test, unname(ref$wald.test))   # Wald test
+all.equal(predict(fit), predict(ref, reference = "sample"),
+          check.attributes = FALSE)
+all.equal(cox_basehaz(fit), basehaz(ref), check.attributes = FALSE)
+```
+
+All `TRUE`. The biggest coefficient difference is about
+`r signif(max(abs(coef(fit) - coef(ref))), 1)`, so basically rounding error.
+
+### A few more data sets
+
+`compare_fits()` fits a model with both coxlite engines and `coxph()` and
+checks if they match.
+
+```{r}
+compare_fits <- function(formula, data, ties) {
+  a <- cox_ph(formula, data, ties = ties)
+  b <- cox_ph(formula, data, ties = ties, engine = "R")
+  r <- coxph(formula, data, ties = ties)
+  same <- function(x, y) isTRUE(all.equal(x, y, check.attributes = FALSE))
+  data.frame(
+    ties = ties,
+    coef = same(coef(a), coef(r)),
+    vcov = same(vcov(a), vcov(r)),
+    loglik = same(a$loglik, r$loglik),
+    R_vs_cpp = same(coef(a), coef(b)),
+    max_abs_diff = format(max(abs(coef(a) - coef(r))), digits = 2)
+  )
+}
+```
+
+Two real data sets from **survival**, and some simulated ones with lots of
+ties, strata or more covariates:
+
+```{r}
+lung <- survival::lung
+lung$status <- lung$status - 1
+veteran <- survival::veteran
+
+set.seed(625)
+sim_ties <- sim_cox(1000, beta = c(0.5, -0.5, 0.25), round_to = 2)
+sim_strat <- sim_cox(2000, beta = c(0.5, 0, -0.3, 1), n_strata = 5,
+                     round_to = 0.5, shape = 2)
+sim_wide <- sim_cox(3000, beta = seq(-1, 1, length.out = 10), round_to = 1)
+
+scenarios <- list(
+  "sim_trial + strata" = list(Surv(time, status) ~ trt + age + biomarker +
+                                strata(center), sim_trial),
+  "lung (factor)"      = list(Surv(time, status) ~ age + sex +
+                                factor(ph.ecog), lung),
+  "veteran + strata"   = list(Surv(time, status) ~ karno + age + trt +
+                                strata(celltype), veteran),
+  "sim heavy ties"     = list(Surv(time, status) ~ x1 + x2 + x3, sim_ties),
+  "sim 5 strata"       = list(Surv(time, status) ~ x1 + x2 + x3 + x4 +
+                                strata(stratum), sim_strat),
+  "sim p = 10"         = list(Surv(time, status) ~ x1 + x2 + x3 + x4 + x5 +
+                                x6 + x7 + x8 + x9 + x10, sim_wide)
+)
+
+results <- do.call(rbind, lapply(names(scenarios), function(nm) {
+  s <- scenarios[[nm]]
+  rbind(cbind(scenario = nm, compare_fits(s[[1]], s[[2]], "efron")),
+        cbind(scenario = nm, compare_fits(s[[1]], s[[2]], "breslow")))
+}))
+knitr::kable(results)
+```
+
+All `r nrow(results)` fits match.
+
+## Efficiency
+
+Timing with `bench::mark()` (which also checks the three give the same
+coefficients):
+
+```{r, eval = has_bench}
+fit_coefs <- function(data, ...) {
+  unname(coef(cox_ph(Surv(time, status) ~ x1 + x2 + x3 + x4 + x5, data, ...)))
+}
+ref_coefs <- function(data) {
+  unname(coef(coxph(Surv(time, status) ~ x1 + x2 + x3 + x4 + x5, data)))
+}
+
+set.seed(1)
+d <- sim_cox(5000, beta = c(0.5, -0.5, 0.25, 1, 0), round_to = 0.5)
+bm <- bench::mark(
+  coxlite_cpp = fit_coefs(d),
+  coxlite_R   = fit_coefs(d, engine = "R"),
+  survival    = ref_coefs(d),
+  iterations = 20, filter_gc = FALSE
+)
+bm[, c("expression", "min", "median", "itr/sec", "mem_alloc")]
+```
+
+### Scaling with sample size
+
+```{r scaling, eval = has_bench, message = FALSE, warning = FALSE}
+sizes <- c(1000, 5000, 20000)
+timings <- do.call(rbind, lapply(sizes, function(n) {
+  set.seed(n)
+  d <- sim_cox(n, beta = c(0.5, -0.5, 0.25, 1, 0), round_to = 0.5)
+  b <- bench::mark(
+    coxlite_cpp = fit_coefs(d),
+    coxlite_R   = fit_coefs(d, engine = "R"),
+    survival    = ref_coefs(d),
+    min_iterations = 3, max_iterations = 10, filter_gc = FALSE
+  )
+  data.frame(n = n, method = as.character(b$expression),
+             median_ms = as.numeric(b$median) * 1000)
+}))
+wide <- reshape(timings, idvar = "n", timevar = "method", direction = "wide")
+names(wide) <- sub("median_ms.", "", names(wide), fixed = TRUE)
+rownames(wide) <- NULL
+wide$cpp_speedup_over_R <- wide$coxlite_R / wide$coxlite_cpp
+knitr::kable(wide, digits = 1, caption = "Median time (ms)")
+```
+
+```{r scaling-plot, eval = has_bench}
+cols <- c(coxlite_cpp = "#1b9e77", coxlite_R = "#d95f02", survival = "#7570b3")
+plot(NULL, xlim = range(sizes), ylim = range(timings$median_ms), log = "xy",
+     xlab = "Sample size n", ylab = "Median time (ms, log scale)")
+for (m in names(cols)) {
+  s <- timings[timings$method == m, ]
+  lines(s$n, s$median_ms, type = "b", pch = 19, col = cols[m])
+}
+legend("topleft", names(cols), col = cols, lty = 1, pch = 19, bty = "n")
+```
+
+## Summary
+
+coxlite matches `coxph()` on everything I checked, for both tie methods and
+with or without strata. The C++ engine is about as fast as `coxph()` (it
+depends on the machine, and `coxph()` also computes some extra stuff like
+residuals). The R engine is a lot slower, mostly because it builds an
+n × p² matrix of outer products where the C++ code just keeps running p × p
+sums.

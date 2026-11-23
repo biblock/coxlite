@@ -1,0 +1,199 @@
+---
+title: "Introduction to coxlite"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Introduction to coxlite}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", fig.width = 6,
+                      fig.height = 4)
+```
+
+```{r setup}
+library(coxlite)
+```
+
+**coxlite** fits Cox proportional hazards models using its own code for the
+partial likelihood and Newton-Raphson. This vignette goes over the method and
+the main functions. The comparison with `survival::coxph()` (results and
+speed) is in `vignette("benchmarks", package = "coxlite")`.
+
+## The model
+
+The Cox model says the hazard for subject $i$ with covariates $x_i$ is
+
+$$h(t \mid x_i) = h_0(t)\, \exp(x_i^\top \beta),$$
+
+where $h_0(t)$ isn't specified. $\beta$ is estimated by maximising the
+partial likelihood. With event times $t_1 < t_2 < \dots$ and risk sets
+$R(t_j) = \{i : T_i \ge t_j\}$, the log partial likelihood is
+
+$$\ell(\beta) = \sum_{j} \Big[ x_{(j)}^\top \beta -
+  \log \sum_{i \in R(t_j)} e^{x_i^\top \beta} \Big].$$
+
+### Tied event times
+
+If $d_j > 1$ people have an event at the same time, the exact partial
+likelihood is expensive, so people use an approximation. Let
+$S_0 = \sum_{i \in R(t_j)} e^{x_i^\top\beta}$ and let $D_0$ be the same sum
+over just the $d_j$ people with an event at $t_j$.
+
+* Breslow uses $S_0$ as the denominator for all $d_j$ events.
+* Efron uses $S_0 - \tfrac{l}{d_j} D_0$ for the $l$-th event
+  ($l = 0, \dots, d_j - 1$). This is the default here and in **survival**,
+  and it's closer to the exact likelihood when there are a lot of ties.
+
+### Newton-Raphson
+
+The score $U(\beta) = \partial \ell / \partial \beta$ and information
+$I(\beta) = -\partial^2 \ell / \partial\beta\, \partial\beta^\top$ only
+need the risk set sums $S_0$, $S_1 = \sum e^{x^\top\beta} x$ and
+$S_2 = \sum e^{x^\top\beta} x x^\top$. If the data are sorted by decreasing
+time, the risk set just grows as you go down the rows, so everything can be
+computed in one pass. Then the update is
+
+$$\beta^{(k+1)} = \beta^{(k)} + I(\beta^{(k)})^{-1} U(\beta^{(k)}),$$
+
+and the step gets halved if $\ell$ goes down. It stops when the relative
+change in $\ell$ is below `eps` ($10^{-9}$ by default), and the variance
+estimate is $I(\hat\beta)^{-1}$. There are two versions of the $\ell$, $U$,
+$I$ code: C++ (`engine = "cpp"`, the default) and R (`engine = "R"`).
+
+## Example data
+
+`sim_trial` is a simulated two-arm trial with 400 patients from four
+centres. Times are rounded to the nearest half month, so there are a lot of
+ties.
+
+```{r}
+str(sim_trial)
+table(duplicated(sim_trial$time[sim_trial$status == 1]))
+```
+
+## Fitting a model
+
+`cox_ph()` works like `coxph()`. `Surv()` is re-exported from **survival**
+so you don't need to load it.
+
+```{r}
+fit <- cox_ph(Surv(time, status) ~ trt + age + biomarker + sex,
+              data = sim_trial)
+fit
+```
+
+`summary()` adds hazard ratios, CIs and the likelihood ratio, Wald and
+score tests:
+
+```{r}
+summary(fit)
+```
+
+Other methods:
+
+```{r}
+coef(fit)
+sqrt(diag(vcov(fit)))
+exp(confint(fit))   # 95% CIs for the hazard ratios
+logLik(fit)
+AIC(fit)
+```
+
+The hazard ratio for treatment is about
+`r round(exp(coef(fit)["trttreatment"]), 2)`. The true value used in the
+simulation was `r round(exp(-0.5), 2)`. This model leaves out centre, which
+pulls the estimate towards 1, and the stratified model below does better.
+
+## Efron vs. Breslow
+
+```{r}
+fit_breslow <- update(fit, ties = "breslow")
+cbind(efron = coef(fit), breslow = coef(fit_breslow))
+```
+
+With this many ties the Breslow estimates are a little closer to zero.
+
+## Stratified models
+
+The four centres have different baseline hazards. Stratifying gives each
+centre its own $h_0(t)$ but the same $\beta$:
+
+```{r}
+fit_strat <- cox_ph(Surv(time, status) ~ trt + age + biomarker + sex +
+                      strata(center), data = sim_trial)
+summary(fit_strat)$coefficients
+```
+
+## Predictions
+
+`predict()` gives linear predictors or relative risks, relative to an
+average subject by default (`reference = "sample"`).
+
+```{r}
+new_patients <- data.frame(trt = c("control", "treatment"), age = 65,
+                           biomarker = 0.5, sex = "female")
+predict(fit, new_patients, type = "risk", se.fit = TRUE)
+```
+
+## Baseline hazard and survival curves
+
+`cox_basehaz()` estimates the cumulative baseline hazard $H_0(t)$. You can
+get a survival curve for any covariates from
+$S(t \mid x) = \exp\{-H_0(t)\, e^{x^\top\beta}\}$.
+
+```{r survival-curves}
+H0 <- cox_basehaz(fit, centered = FALSE)
+lp <- predict(fit, new_patients, reference = "zero")
+plot(H0$time, exp(-H0$hazard * exp(lp[1])), type = "s", ylim = c(0, 1),
+     xlab = "Months since enrolment", ylab = "Survival probability",
+     main = "Predicted survival, 65-year-old woman")
+lines(H0$time, exp(-H0$hazard * exp(lp[2])), type = "s", lty = 2)
+legend("bottomleft", c("Control", "Treatment"), lty = 1:2, bty = "n")
+```
+
+A stratified model has one curve per stratum:
+
+```{r strata-curves}
+H0s <- cox_basehaz(fit_strat)
+plot(NULL, xlim = range(H0s$time), ylim = range(H0s$hazard),
+     xlab = "Months", ylab = "Cumulative baseline hazard")
+for (k in seq_along(levels(H0s$strata))) {
+  s <- H0s[H0s$strata == levels(H0s$strata)[k], ]
+  lines(s$time, s$hazard, type = "s", col = k)
+}
+legend("topleft", levels(H0s$strata), col = seq_along(levels(H0s$strata)),
+       lty = 1, bty = "n")
+```
+
+## Simulation
+
+`sim_cox()` simulates data from a Cox model with a Weibull baseline.
+`cox_fit()` fits straight from a matrix, which is easier in a loop like this:
+
+```{r}
+set.seed(2026)
+beta_true <- c(0.8, -0.5, 0)
+est <- replicate(200, {
+  d <- sim_cox(300, beta = beta_true, shape = 1.5, cens_rate = 0.1)
+  coef(cox_fit(as.matrix(d[, c("x1", "x2", "x3")]), d$time, d$status))
+})
+rbind(true = beta_true, mean_estimate = rowMeans(est),
+      empirical_sd = apply(est, 1, sd))
+```
+
+The estimates look unbiased.
+
+## Real data
+
+The `lung` data from **survival**:
+
+```{r}
+lung <- survival::lung
+lung$status <- lung$status - 1   # recode 1/2 to 0/1
+fit_lung <- cox_ph(Surv(time, status) ~ age + sex + ph.ecog, data = lung)
+summary(fit_lung)
+```
+
+Rows with missing values get dropped, same as `coxph()`.

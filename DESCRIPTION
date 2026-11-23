@@ -1,0 +1,31 @@
+Package: coxlite
+Type: Package
+Title: Cox Proportional Hazards Model from Scratch
+Version: 0.1.0
+Authors@R:
+    person("Billy", "Block", email = "biblock@umich.edu",
+           role = c("aut", "cre"))
+Description: Fits Cox proportional hazards models for right-censored
+    data with a Newton-Raphson implementation of the partial likelihood.
+    Handles Breslow and Efron ties, strata and factor covariates, and
+    estimates the baseline hazard. The likelihood code is written both in
+    R and in C++ (via 'Rcpp'). Gives the same results as survival::coxph().
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+Depends:
+    R (>= 3.5.0)
+Imports:
+    Rcpp (>= 1.0.0),
+    stats,
+    survival
+LinkingTo:
+    Rcpp
+Suggests:
+    bench,
+    knitr,
+    rmarkdown,
+    testthat (>= 3.0.0)
+VignetteBuilder: knitr
+Config/testthat/edition: 3
+RoxygenNote: 7.3.1
